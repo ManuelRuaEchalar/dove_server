@@ -3,25 +3,35 @@ const sqlite3 = require('sqlite3').verbose();
 const crypto = require('crypto');
 const path = require('path');
 const cors = require('cors');
+require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Middleware
 app.use(express.json());
-app.use(cors());
+
+// Configuración de CORS
+const corsOptions = {
+    origin: process.env.FRONTEND_URL,
+    methods: ['GET', 'POST', 'PUT', 'DELETE'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    credentials: true // Si necesitas enviar cookies o headers de autenticación
+};
+
+app.use(cors(corsOptions));
 
 // Configuración de la base de datos
-const dbPath = path.join(__dirname, 'game_scores.db');
+const dbPath = process.env.DB_PATH
 const db = new sqlite3.Database(dbPath);
 
 // Configuración del juego
 const GAME_CONFIG = {
-    MIN_GAME_DURATION: 1, // 10 segundos mínimo
-    MAX_GAME_DURATION: 600000, // 10 minutos máximo
-    TOKEN_EXPIRY: 300000, // 5 minutos para usar el token
-    MAX_SCORE: 999999, // Puntuación máxima válida
-    MIN_SCORE: 0 // Puntuación mínima válida
+    MIN_GAME_DURATION:  process.env.MIN_GAME_DURATION, // 10 segundos mínimo
+    MAX_GAME_DURATION: process.env.MAX_GAME_DURATION, // 10 minutos máximo
+    TOKEN_EXPIRY: process.env.TOKEN_EXPIRY, // 5 minutos para usar el token
+    MAX_SCORE: process.env.MAX_SCORE, // Puntuación máxima válida
+    MIN_SCORE: process.env.MIN_SCORE // Puntuación mínima válida
 };
 
 // Inicializar base de datos
