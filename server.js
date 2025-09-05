@@ -1,7 +1,6 @@
 const express = require('express');
-const sqlite3 = require('sqlite3').verbose();
+const { Pool } = require('pg');
 const crypto = require('crypto');
-const path = require('path');
 const cors = require('cors');
 require('dotenv').config();
 
@@ -21,9 +20,13 @@ const corsOptions = {
 
 app.use(cors(corsOptions));
 
-// Configuración de la base de datos
-const dbPath = process.env.DB_PATH
-const db = new sqlite3.Database(dbPath);
+// Configuración de la base de datos PostgreSQL
+const pool = new Pool({
+    connectionString: process.env.DB_PATH,
+    ssl: {
+        rejectUnauthorized: false // Necesario para Neon
+    }
+});
 
 // Configuración del juego
 const GAME_CONFIG = {
@@ -35,31 +38,40 @@ const GAME_CONFIG = {
 };
 
 // Inicializar base de datos
-db.serialize(() => {
-    // Tabla para las partidas activas
-    db.run(`CREATE TABLE IF NOT EXISTS active_games (
-        id TEXT PRIMARY KEY,
-        start_time INTEGER NOT NULL,
-        created_at INTEGER DEFAULT (strftime('%s','now'))
-    )`);
-    
-    // Tabla para el top 3
-    db.run(`CREATE TABLE IF NOT EXISTS top_scores (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT NOT NULL,
-        score INTEGER NOT NULL,
-        achieved_at INTEGER DEFAULT (strftime('%s','now'))
-    )`);
-    
-    // Tabla para tokens pendientes
-    db.run(`CREATE TABLE IF NOT EXISTS pending_tokens (
-        id TEXT PRIMARY KEY,
-        token_hash TEXT NOT NULL,
-        score INTEGER NOT NULL,
-        game_duration INTEGER NOT NULL,
-        expires_at INTEGER NOT NULL
-    )`);
-});
+async function initializeDatabase() {
+    try {
+        // Tabla para las partidas activas
+        await pool.query(`CREATE TABLE IF NOT EXISTS active_games (
+            id TEXT PRIMARY KEY,
+            start_time BIGINT NOT NULL,
+            created_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+        )`);
+        
+        // Tabla para el top 3
+        await pool.query(`CREATE TABLE IF NOT EXISTS top_scores (
+            id SERIAL PRIMARY KEY,
+            username TEXT NOT NULL,
+            score INTEGER NOT NULL,
+            achieved_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+        )`);
+        
+        // Tabla para tokens pendientes
+        await pool.query(`CREATE TABLE IF NOT EXISTS pending_tokens (
+            id TEXT PRIMARY KEY,
+            token_hash TEXT NOT NULL,
+            score INTEGER NOT NULL,
+            game_duration INTEGER NOT NULL,
+            expires_at BIGINT NOT NULL
+        )`);
+        
+        console.log('Base de datos inicializada correctamente');
+    } catch (error) {
+        console.error('Error inicializando la base de datos:', error);
+    }
+}
+
+// Inicializar la base de datos
+initializeDatabase();
 
 // Función para generar ID único
 function generateId() {
@@ -77,59 +89,77 @@ function hashToken(token) {
 }
 
 // Función para limpiar datos expirados
-function cleanupExpiredData() {
+async function cleanupExpiredData() {
     const now = Date.now();
     
-    // Limpiar tokens expirados
-    db.run('DELETE FROM pending_tokens WHERE expires_at < ?', [now]);
-    
-    // Limpiar partidas muy antiguas (más de 1 hora)
-    db.run('DELETE FROM active_games WHERE created_at < ?', [Math.floor(now / 1000) - 3600]);
+    try {
+        // Limpiar tokens expirados
+        await pool.query('DELETE FROM pending_tokens WHERE expires_at < $1', [now]);
+        
+        // Limpiar partidas muy antiguas (más de 1 hora)
+        await pool.query('DELETE FROM active_games WHERE created_at < $1', [Math.floor(now / 1000) - 3600]);
+    } catch (error) {
+        console.error('Error limpiando datos expirados:', error);
+    }
 }
 
 // Función para obtener el top 3
-function getTop3Scores(callback) {
-    db.all(
-        'SELECT username, score FROM top_scores ORDER BY score DESC LIMIT 3',
-        [],
-        callback
-    );
+async function getTop3Scores() {
+    try {
+        const result = await pool.query(
+            'SELECT username, score FROM top_scores ORDER BY score DESC LIMIT 3'
+        );
+        return { error: null, rows: result.rows };
+    } catch (error) {
+        return { error, rows: null };
+    }
 }
 
 // Función para verificar si una puntuación entra en el top 3
-function isTop3Score(score, callback) {
-    db.all(
-        'SELECT score FROM top_scores ORDER BY score DESC LIMIT 3',
-        [],
-        (err, rows) => {
-            if (err) return callback(err, false);
-            
-            if (rows.length < 3) {
-                // Hay menos de 3 puntuaciones, siempre entra
-                return callback(null, true);
-            }
-            
-            const lowestTop3 = rows[rows.length - 1].score;
-            callback(null, score > lowestTop3);
+async function isTop3Score(score) {
+    try {
+        const result = await pool.query(
+            'SELECT score FROM top_scores ORDER BY score DESC LIMIT 3'
+        );
+        
+        if (result.rows.length < 3) {
+            // Hay menos de 3 puntuaciones, siempre entra
+            return { error: null, isTop3: true };
         }
-    );
+        
+        const lowestTop3 = result.rows[result.rows.length - 1].score;
+        return { error: null, isTop3: score > lowestTop3 };
+    } catch (error) {
+        return { error, isTop3: false };
+    }
 }
 
 // Función para actualizar el top 3
-function updateTop3(username, score, callback) {
-    db.serialize(() => {
-        db.run('INSERT INTO top_scores (username, score) VALUES (?, ?)', [username, score]);
+async function updateTop3(username, score) {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        
+        await client.query('INSERT INTO top_scores (username, score) VALUES ($1, $2)', [username, score]);
         
         // Mantener solo el top 3
-        db.run(`
+        await client.query(`
             DELETE FROM top_scores 
             WHERE id NOT IN (
                 SELECT id FROM top_scores 
                 ORDER BY score DESC 
                 LIMIT 3
             )
-        `, callback);
-    });
+        `);
+        
+        await client.query('COMMIT');
+        return { error: null };
+    } catch (error) {
+        await client.query('ROLLBACK');
+        return { error };
+    } finally {
+        client.release();
+    }
 }
 
 // Limpiar datos expirados cada 5 minutos
@@ -138,30 +168,30 @@ setInterval(cleanupExpiredData, 5 * 60 * 1000);
 // RUTAS DE LA API
 
 // 1. Iniciar partida
-app.post('/api/game/start', (req, res) => {
+app.post('/api/game/start', async (req, res) => {
     const gameId = generateId();
     const startTime = Date.now();
     
-    db.run(
-        'INSERT INTO active_games (id, start_time) VALUES (?, ?)',
-        [gameId, startTime],
-        function(err) {
-            if (err) {
-                console.error('Error al iniciar partida:', err);
-                return res.status(500).json({ error: 'Error interno del servidor' });
-            }
-            
-            res.json({ 
-                gameId,
-                message: 'Partida iniciada correctamente'
-            });
-        }
-    );
-    console.log("Partida iniciada con ID:", gameId);
+    try {
+        await pool.query(
+            'INSERT INTO active_games (id, start_time) VALUES ($1, $2)',
+            [gameId, startTime]
+        );
+        
+        res.json({ 
+            gameId,
+            message: 'Partida iniciada correctamente'
+        });
+        
+        console.log("Partida iniciada con ID:", gameId);
+    } catch (error) {
+        console.error('Error al iniciar partida:', error);
+        return res.status(500).json({ error: 'Error interno del servidor' });
+    }
 });
 
 // 2. Terminar partida
-app.post('/api/game/end', (req, res) => {
+app.post('/api/game/end', async (req, res) => {
     const { gameId, score } = req.body;
     const endTime = Date.now();
     
@@ -174,79 +204,72 @@ app.post('/api/game/end', (req, res) => {
         return res.status(400).json({ error: 'Puntuación fuera del rango válido' });
     }
     
-    // Verificar que la partida existe
-    db.get(
-        'SELECT start_time FROM active_games WHERE id = ?',
-        [gameId],
-        (err, row) => {
-            if (err) {
-                console.error('Error al buscar partida:', err);
-                return res.status(500).json({ error: 'Error interno del servidor' });
-            }
-            
-            if (!row) {
-                return res.status(404).json({ error: 'Partida no encontrada o expirada' });
-            }
-            
-            const gameDuration = endTime - row.start_time;
-            
-            // Validar duración del juego
-            if (gameDuration < GAME_CONFIG.MIN_GAME_DURATION || 
-                gameDuration > GAME_CONFIG.MAX_GAME_DURATION) {
-                // Eliminar la partida inválida
-                db.run('DELETE FROM active_games WHERE id = ?', [gameId]);
-                return res.status(400).json({ 
-                    error: 'Duración de partida inválida',
-                    duration: gameDuration
-                });
-            }
-            
-            // Verificar si la puntuación entra en el top 3
-            isTop3Score(score, (err, isTop3) => {
-                if (err) {
-                    console.error('Error al verificar top 3:', err);
-                    return res.status(500).json({ error: 'Error interno del servidor' });
-                }
-                
-                // Eliminar la partida completada
-                db.run('DELETE FROM active_games WHERE id = ?', [gameId]);
-                
-                if (!isTop3) {
-                    return res.json({ 
-                        isTop3: false,
-                        message: 'Puntuación registrada, pero no entra en el top 3'
-                    });
-                }
-                
-                // Generar token para top 3
-                const token = generateSecureToken();
-                const tokenHash = hashToken(token);
-                const expiresAt = Date.now() + GAME_CONFIG.TOKEN_EXPIRY;
-                
-                db.run(
-                    'INSERT INTO pending_tokens (id, token_hash, score, game_duration, expires_at) VALUES (?, ?, ?, ?, ?)',
-                    [gameId, tokenHash, score, gameDuration, expiresAt],
-                    (err) => {
-                        if (err) {
-                            console.error('Error al guardar token:', err);
-                            return res.status(500).json({ error: 'Error interno del servidor' });
-                        }
-                        
-                        res.json({
-                            isTop3: true,
-                            token,
-                            expiresIn: GAME_CONFIG.TOKEN_EXPIRY,
-                            message: 'Felicitaciones! Entraste al top 3. Registra tu nombre.'
-                        });
-                    }
-                );
+    try {
+        // Verificar que la partida existe
+        const result = await pool.query(
+            'SELECT start_time FROM active_games WHERE id = $1',
+            [gameId]
+        );
+        
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Partida no encontrada o expirada' });
+        }
+        
+        const gameDuration = endTime - result.rows[0].start_time;
+        
+        // Validar duración del juego
+        if (gameDuration < GAME_CONFIG.MIN_GAME_DURATION || 
+            gameDuration > GAME_CONFIG.MAX_GAME_DURATION) {
+            // Eliminar la partida inválida
+            await pool.query('DELETE FROM active_games WHERE id = $1', [gameId]);
+            return res.status(400).json({ 
+                error: 'Duración de partida inválida',
+                duration: gameDuration
             });
         }
-    );
+        
+        // Verificar si la puntuación entra en el top 3
+        const { error: top3Error, isTop3 } = await isTop3Score(score);
+        if (top3Error) {
+            console.error('Error al verificar top 3:', top3Error);
+            return res.status(500).json({ error: 'Error interno del servidor' });
+        }
+        
+        // Eliminar la partida completada
+        await pool.query('DELETE FROM active_games WHERE id = $1', [gameId]);
+        
+        if (!isTop3) {
+            return res.json({ 
+                isTop3: false,
+                message: 'Puntuación registrada, pero no entra en el top 3'
+            });
+        }
+        
+        // Generar token para top 3
+        const token = generateSecureToken();
+        const tokenHash = hashToken(token);
+        const expiresAt = Date.now() + GAME_CONFIG.TOKEN_EXPIRY;
+        
+        await pool.query(
+            'INSERT INTO pending_tokens (id, token_hash, score, game_duration, expires_at) VALUES ($1, $2, $3, $4, $5)',
+            [gameId, tokenHash, score, gameDuration, expiresAt]
+        );
+        
+        res.json({
+            isTop3: true,
+            token,
+            expiresIn: GAME_CONFIG.TOKEN_EXPIRY,
+            message: 'Felicitaciones! Entraste al top 3. Registra tu nombre.'
+        });
+        
+    } catch (error) {
+        console.error('Error al terminar partida:', error);
+        return res.status(500).json({ error: 'Error interno del servidor' });
+    }
 });
 
 // 3. Registrar nombre en el top 3
-app.post('/api/game/register-top3', (req, res) => {
+app.post('/api/game/register-top3', async (req, res) => {
     const { gameId, username, token } = req.body;
     
     // Validaciones
@@ -261,51 +284,53 @@ app.post('/api/game/register-top3', (req, res) => {
     const tokenHash = hashToken(token);
     const now = Date.now();
     
-    // Verificar token
-    db.get(
-        'SELECT score, expires_at FROM pending_tokens WHERE id = ? AND token_hash = ?',
-        [gameId, tokenHash],
-        (err, row) => {
-            if (err) {
-                console.error('Error al verificar token:', err);
-                return res.status(500).json({ error: 'Error interno del servidor' });
-            }
-            
-            if (!row) {
-                return res.status(404).json({ error: 'Token inválido o expirado' });
-            }
-            
-            if (now > row.expires_at) {
-                // Limpiar token expirado
-                db.run('DELETE FROM pending_tokens WHERE id = ?', [gameId]);
-                return res.status(410).json({ error: 'Token expirado' });
-            }
-            
-            // Registrar en el top 3
-            updateTop3(username.trim(), row.score, (err) => {
-                if (err) {
-                    console.error('Error al actualizar top 3:', err);
-                    return res.status(500).json({ error: 'Error interno del servidor' });
-                }
-                
-                // Limpiar token usado
-                db.run('DELETE FROM pending_tokens WHERE id = ?', [gameId]);
-                
-                res.json({
-                    success: true,
-                    message: 'Nombre registrado correctamente en el top 3',
-                    score: row.score
-                });
-            });
+    try {
+        // Verificar token
+        const result = await pool.query(
+            'SELECT score, expires_at FROM pending_tokens WHERE id = $1 AND token_hash = $2',
+            [gameId, tokenHash]
+        );
+        
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Token inválido o expirado' });
         }
-    );
+        
+        const tokenData = result.rows[0];
+        
+        if (now > tokenData.expires_at) {
+            // Limpiar token expirado
+            await pool.query('DELETE FROM pending_tokens WHERE id = $1', [gameId]);
+            return res.status(410).json({ error: 'Token expirado' });
+        }
+        
+        // Registrar en el top 3
+        const { error: updateError } = await updateTop3(username.trim(), tokenData.score);
+        if (updateError) {
+            console.error('Error al actualizar top 3:', updateError);
+            return res.status(500).json({ error: 'Error interno del servidor' });
+        }
+        
+        // Limpiar token usado
+        await pool.query('DELETE FROM pending_tokens WHERE id = $1', [gameId]);
+        
+        res.json({
+            success: true,
+            message: 'Nombre registrado correctamente en el top 3',
+            score: tokenData.score
+        });
+        
+    } catch (error) {
+        console.error('Error al registrar en top 3:', error);
+        return res.status(500).json({ error: 'Error interno del servidor' });
+    }
 });
 
 // 4. Obtener top 3
-app.get('/api/leaderboard', (req, res) => {
-    getTop3Scores((err, scores) => {
-        if (err) {
-            console.error('Error al obtener top 3:', err);
+app.get('/api/leaderboard', async (req, res) => {
+    try {
+        const { error, rows: scores } = await getTop3Scores();
+        if (error) {
+            console.error('Error al obtener top 3:', error);
             return res.status(500).json({ error: 'Error interno del servidor' });
         }
         
@@ -313,7 +338,10 @@ app.get('/api/leaderboard', (req, res) => {
             leaderboard: scores,
             timestamp: new Date().toISOString()
         });
-    });
+    } catch (error) {
+        console.error('Error al obtener top 3:', error);
+        return res.status(500).json({ error: 'Error interno del servidor' });
+    }
 });
 
 // 5. Ruta de estado del servidor
@@ -336,27 +364,31 @@ app.use('*', (req, res) => {
     res.status(404).json({ error: 'Ruta no encontrada' });
 });
 
-// Iniciar servidor
-app.listen(PORT, () => {
-    console.log(`🎮 Servidor de puntuaciones ejecutándose en http://localhost:${PORT}`);
-    console.log(`📊 Base de datos: ${dbPath}`);
-    console.log('🚀 API endpoints disponibles:');
-    console.log('   POST /api/game/start - Iniciar partida');
-    console.log('   POST /api/game/end - Terminar partida');
-    console.log('   POST /api/game/register-top3 - Registrar nombre en top 3');
-    console.log('   GET /api/leaderboard - Obtener tabla de puntuaciones');
-    console.log('   GET /api/health - Estado del servidor');
-});
+// Para Vercel, exportar la app
+module.exports = app;
+
+// Para desarrollo local
+if (!process.env.VERCEL) {
+    app.listen(PORT, () => {
+        console.log(`🎮 Servidor de puntuaciones ejecutándose en http://localhost:${PORT}`);
+        console.log(`📊 Base de datos: PostgreSQL`);
+        console.log('🚀 API endpoints disponibles:');
+        console.log('   POST /api/game/start - Iniciar partida');
+        console.log('   POST /api/game/end - Terminar partida');
+        console.log('   POST /api/game/register-top3 - Registrar nombre en top 3');
+        console.log('   GET /api/leaderboard - Obtener tabla de puntuaciones');
+        console.log('   GET /api/health - Estado del servidor');
+    });
+}
 
 // Manejo graceful del cierre del servidor
-process.on('SIGINT', () => {
+process.on('SIGINT', async () => {
     console.log('\n🔄 Cerrando servidor...');
-    db.close((err) => {
-        if (err) {
-            console.error('Error al cerrar la base de datos:', err);
-        } else {
-            console.log('✅ Base de datos cerrada correctamente');
-        }
-        process.exit(0);
-    });
+    try {
+        await pool.end();
+        console.log('✅ Conexiones de base de datos cerradas correctamente');
+    } catch (error) {
+        console.error('Error al cerrar las conexiones de base de datos:', error);
+    }
+    process.exit(0);
 });
